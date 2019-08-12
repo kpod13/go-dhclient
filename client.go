@@ -22,19 +22,19 @@ type Callback func(*Lease)
 // Client is a DHCP client instance
 type Client struct {
 	Hostname    string
-	Iface       *net.Interface
+	Iface       func() *net.Interface
 	Lease       *Lease           // The current lease
 	OnBound     Callback         // On renew or rebound
-	OnExpire    Callback         // On expiration of a lease
 	DHCPOptions []Option         // List of options to send on discovery and requests
 	HWAddr      net.HardwareAddr // client's hardware address
 
-	conn     *raw.Conn // Raw socket
-	xid      uint32    // Transaction ID
-	rebind   bool
-	shutdown bool
-	notify   chan struct{}  // Is closed on shutdown
-	wg       sync.WaitGroup // For graceful shutdown
+	conn      *raw.Conn // Raw socket
+	xid       uint32    // Transaction ID
+	rebind    bool
+	isEnabled bool
+	isDied    bool
+	notify    chan struct{}
+	c         *sync.Cond
 }
 
 // Lease is an assignment by the DHCP server
@@ -91,54 +91,90 @@ func (client *Client) AddParamRequest(dhcpOpt layers.DHCPOpt) {
 	client.AddOption(layers.DHCPOptParamsRequest, []byte{byte(dhcpOpt)})
 }
 
-// Start starts the client
-func (client *Client) Start() {
+// NewClient -
+func NewClient(HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound Callback) *Client {
+	mx := sync.Mutex{}
+	mx.Lock()
+
+	client := &Client{
+		Iface:   getIface,
+		HWAddr:  HWAddr,
+		OnBound: OnBound,
+		notify:  make(chan struct{}),
+		c:       sync.NewCond(&mx),
+	}
 
 	// Add default DHCP options if none added yet.
-	if client.DHCPOptions == nil {
-		for _, param := range DefaultParamsRequestList {
-			client.AddParamRequest(param)
-		}
-		client.AddOption(layers.DHCPOptHostname, []byte(client.Hostname))
+	for _, param := range DefaultParamsRequestList {
+		client.AddParamRequest(param)
 	}
 
-	if client.notify != nil {
-		log.Panicf("client for %s already started", client.Iface.Name)
-	}
-	client.notify = make(chan struct{})
-	client.wg.Add(1)
+	// client.wg.Add(1)
 	go client.run()
+
+	return client
 }
 
-// Stop stops the client
-func (client *Client) Stop() {
-	log.Printf("[%s] shutting down dhclient", client.Iface.Name)
-	client.shutdown = true
-	close(client.notify)
+// Enable starts the client
+func (client *Client) Enable() {
+	log.Printf("dhclient: start for [%s]", client.Iface().Name)
 
-	client.wg.Wait()
+	if client.isEnabled {
+		client.Rebind()
+		return
+	}
+
+	client.isEnabled = true
+	client.c.Signal()
 }
 
-// Renew triggers the renewal of the current lease
-func (client *Client) Renew() {
+// Disable stops the client
+func (client *Client) Disable() {
+	log.Printf("dhclient: stop for [%s]", client.Iface().Name)
+
+	client.isEnabled = false
+	client.sendNotify()
+}
+
+// Destroy -
+func (client *Client) Destroy() {
+	log.Printf("dhclient: destroy for [%s]", client.Iface().Name)
+
+	client.isDied = true
+	client.sendNotify()
+	client.c.Signal()
+}
+
+func (client *Client) sendNotify() {
 	select {
 	case client.notify <- struct{}{}:
 	default:
 	}
 }
 
+// Renew triggers the renewal of the current lease
+func (client *Client) Renew() {
+	log.Printf("dhclient: renew on [%s]", client.Iface().Name)
+
+	client.sendNotify()
+}
+
 // Rebind forgets the current lease and triggers acquirement of a new one
 func (client *Client) Rebind() {
 	client.rebind = true
 	client.Lease = nil
-	client.Renew()
+	client.sendNotify()
 }
 
 func (client *Client) run() {
-	for !client.shutdown {
-		client.runOnce()
+	for !client.isDied {
+		if client.isEnabled {
+			client.runOnce()
+			continue
+		}
+
+		client.c.Wait()
 	}
-	client.wg.Done()
 }
 
 func (client *Client) runOnce() {
@@ -156,7 +192,7 @@ func (client *Client) runOnce() {
 	}
 
 	if err != nil {
-		log.Printf("[%s] error: %s", client.Iface.Name, err)
+		log.Printf("dhclient: [%s] error: %s", client.Iface().Name, err)
 		// delay for a second
 		select {
 		case <-client.notify:
@@ -183,14 +219,11 @@ func (client *Client) runOnce() {
 
 // unbound removes the lease
 func (client *Client) unbound() {
-	if cb := client.OnExpire; cb != nil {
-		cb(client.Lease)
-	}
 	client.Lease = nil
 }
 
 func (client *Client) withConnection(f func() error) error {
-	conn, err := raw.ListenPacket(client.Iface, uint16(layers.EthernetTypeIPv4), nil)
+	conn, err := raw.ListenPacket(client.Iface(), uint16(layers.EthernetTypeIPv4), nil)
 	if err != nil {
 		return err
 	}
@@ -272,7 +305,7 @@ func (client *Client) request(lease *Lease) error {
 		err = errors.New("received NAK")
 		client.unbound()
 	default:
-		err = fmt.Errorf("unexpected response: %s", msgType.String())
+		err = fmt.Errorf("dhclient: unexpected response: %s", msgType.String())
 	}
 
 	return err
@@ -280,7 +313,7 @@ func (client *Client) request(lease *Lease) error {
 
 // sendPacket creates and sends a DHCP packet
 func (client *Client) sendPacket(msgType layers.DHCPMsgType, options []Option) error {
-	log.Printf("[%s] sending %s", client.Iface.Name, msgType)
+	log.Printf("dhclient: [%s] sending %s", client.Iface().Name, msgType)
 	return client.sendMulticast(client.newPacket(msgType, options))
 }
 
@@ -288,7 +321,7 @@ func (client *Client) sendPacket(msgType layers.DHCPMsgType, options []Option) e
 func (client *Client) newPacket(msgType layers.DHCPMsgType, options []Option) *layers.DHCPv4 {
 	hwAddr := client.HWAddr
 	if hwAddr == nil {
-		hwAddr = client.Iface.HardwareAddr
+		hwAddr = client.Iface().HardwareAddr
 	}
 	packet := layers.DHCPv4{
 		Operation:    layers.DHCPOpRequest,
@@ -319,7 +352,7 @@ func (client *Client) newPacket(msgType layers.DHCPMsgType, options []Option) *l
 func (client *Client) sendMulticast(dhcp *layers.DHCPv4) error {
 	eth := layers.Ethernet{
 		EthernetType: layers.EthernetTypeIPv4,
-		SrcMAC:       client.Iface.HardwareAddr,
+		SrcMAC:       client.Iface().HardwareAddr,
 		DstMAC:       layers.EthernetBroadcast,
 	}
 	ip := layers.IPv4{
@@ -374,7 +407,7 @@ func (client *Client) waitForResponse(msgTypes ...layers.DHCPMsgType) (layers.DH
 			// do we have the expected message type?
 			for _, t := range msgTypes {
 				if t == msgType {
-					log.Printf("[%s] received %s", client.Iface.Name, msgType)
+					log.Printf("dhclient: [%s] received %s", client.Iface().Name, msgType)
 					return msgType, &res, nil
 				}
 			}

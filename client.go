@@ -187,8 +187,9 @@ func (client *Client) run() {
 }
 
 func (client *Client) completeCnabling(err error) {
-	if cb := client.OnEexchange; cb != nil {
-		cb(err)
+	if client.OnEexchange != nil {
+		client.OnEexchange(err)
+		client.OnEexchange = nil
 	}
 }
 
@@ -215,8 +216,10 @@ func (client *Client) runOnce() {
 		case <-time.After(time.Second):
 		}
 
-		client.completeCnabling(err)
-		return
+		if client.Lease == nil {
+			client.completeCnabling(err)
+			return
+		}
 	}
 
 	client.completeCnabling(nil)

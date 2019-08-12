@@ -14,7 +14,7 @@ import (
 	"github.com/mdlayher/raw"
 )
 
-const responseTimeout = time.Second * 5
+const responseTimeout = time.Second * 10
 
 // Callback is a function called on certain events
 type Callback func(*Lease)
@@ -37,6 +37,8 @@ type Client struct {
 	isDied    bool
 	notify    chan struct{}
 	c         *sync.Cond
+
+	err chan error
 }
 
 // Lease is an assignment by the DHCP server
@@ -104,6 +106,7 @@ func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.
 		HWAddr:     HWAddr,
 		OnBound:    OnBound,
 		notify:     make(chan struct{}),
+		err:        make(chan error),
 		c:          sync.NewCond(&mx),
 	}
 
@@ -119,16 +122,18 @@ func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.
 }
 
 // Enable starts the client
-func (client *Client) Enable() {
+func (client *Client) Enable() error {
 	log.Printf("dhclient [%s]: start", client.clientName)
 
 	if client.isEnabled {
 		client.Rebind()
-		return
+		return <-client.err
 	}
 
 	client.isEnabled = true
 	client.c.Signal()
+
+	return <-client.err
 }
 
 // Disable stops the client
@@ -180,8 +185,16 @@ func (client *Client) run() {
 	}
 }
 
+func (client *Client) sendErr(err error) {
+	select {
+	case client.err <- err:
+	default:
+	}
+}
+
 func (client *Client) runOnce() {
 	var err error
+
 	if client.Lease == nil || client.rebind {
 		// request new lease
 		err = client.withConnection(client.discoverAndRequest)
@@ -201,10 +214,12 @@ func (client *Client) runOnce() {
 		case <-client.notify:
 		case <-time.After(time.Second):
 		}
-		if client.Lease == nil {
-			return
-		}
+
+		client.sendErr(err)
+		return
 	}
+
+	client.sendErr(nil)
 
 	select {
 	case <-client.notify:
@@ -321,7 +336,7 @@ func (client *Client) request(ifi *net.Interface, lease *Lease) error {
 
 // sendPacket creates and sends a DHCP packet
 func (client *Client) sendPacket(ifi *net.Interface, msgType layers.DHCPMsgType, options []Option) error {
-	log.Printf("dhclient [%s]: sending %s", client.clientName, msgType)
+	log.Printf("dhclient [%s]: sending %s via [%s]", client.clientName, msgType, ifi.Name)
 	return client.sendMulticast(ifi, client.newPacket(ifi, msgType, options))
 }
 

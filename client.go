@@ -19,8 +19,8 @@ const responseTimeout = time.Second * 10
 // OnBoundCallback is a function called on certain events
 type OnBoundCallback func(*Lease)
 
-// OnEexchangeCallback is a function called on enabling will end
-type OnEexchangeCallback func(error)
+// OnExchangeCallback is a function called on enabling will end
+type OnExchangeCallback func(error)
 
 // Client is a DHCP client instance
 type Client struct {
@@ -30,7 +30,7 @@ type Client struct {
 	Iface       func() *net.Interface
 	Lease       *Lease          // The current lease
 	OnBound     OnBoundCallback // On renew or rebound
-	OnEexchange OnEexchangeCallback
+	OnEexchange OnExchangeCallback
 	DHCPOptions []Option         // List of options to send on discovery and requests
 	HWAddr      net.HardwareAddr // client's hardware address
 
@@ -97,7 +97,7 @@ func (client *Client) AddParamRequest(dhcpOpt layers.DHCPOpt) {
 	client.AddOption(layers.DHCPOptParamsRequest, []byte{byte(dhcpOpt)})
 }
 
-// NewClient -
+// NewClient create and return new client
 func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound OnBoundCallback) *Client {
 	mx := sync.Mutex{}
 	mx.Lock()
@@ -123,7 +123,7 @@ func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.
 }
 
 // Enable starts the client
-func (client *Client) Enable(cb OnEexchangeCallback) {
+func (client *Client) Enable(cb OnExchangeCallback) {
 	log.Printf("dhclient [%s]: start", client.clientName)
 
 	client.OnEexchange = cb

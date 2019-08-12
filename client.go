@@ -16,8 +16,11 @@ import (
 
 const responseTimeout = time.Second * 10
 
-// Callback is a function called on certain events
-type Callback func(*Lease)
+// OnBoundCallback is a function called on certain events
+type OnBoundCallback func(*Lease)
+
+// OnEexchangeCallback is a function called on enabling will end
+type OnEexchangeCallback func(error)
 
 // Client is a DHCP client instance
 type Client struct {
@@ -25,8 +28,9 @@ type Client struct {
 
 	Hostname    string
 	Iface       func() *net.Interface
-	Lease       *Lease           // The current lease
-	OnBound     Callback         // On renew or rebound
+	Lease       *Lease          // The current lease
+	OnBound     OnBoundCallback // On renew or rebound
+	OnEexchange OnEexchangeCallback
 	DHCPOptions []Option         // List of options to send on discovery and requests
 	HWAddr      net.HardwareAddr // client's hardware address
 
@@ -37,8 +41,6 @@ type Client struct {
 	isDied    bool
 	notify    chan struct{}
 	c         *sync.Cond
-
-	err chan error
 }
 
 // Lease is an assignment by the DHCP server
@@ -96,7 +98,7 @@ func (client *Client) AddParamRequest(dhcpOpt layers.DHCPOpt) {
 }
 
 // NewClient -
-func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound Callback) *Client {
+func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound OnBoundCallback) *Client {
 	mx := sync.Mutex{}
 	mx.Lock()
 
@@ -106,7 +108,6 @@ func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.
 		HWAddr:     HWAddr,
 		OnBound:    OnBound,
 		notify:     make(chan struct{}),
-		err:        make(chan error),
 		c:          sync.NewCond(&mx),
 	}
 
@@ -122,18 +123,18 @@ func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.
 }
 
 // Enable starts the client
-func (client *Client) Enable() error {
+func (client *Client) Enable(cb OnEexchangeCallback) {
 	log.Printf("dhclient [%s]: start", client.clientName)
+
+	client.OnEexchange = cb
 
 	if client.isEnabled {
 		client.Rebind()
-		return <-client.err
+		return
 	}
 
 	client.isEnabled = true
 	client.c.Signal()
-
-	return <-client.err
 }
 
 // Disable stops the client
@@ -185,10 +186,9 @@ func (client *Client) run() {
 	}
 }
 
-func (client *Client) sendErr(err error) {
-	select {
-	case client.err <- err:
-	default:
+func (client *Client) completeCnabling(err error) {
+	if cb := client.OnEexchange; cb != nil {
+		cb(err)
 	}
 }
 
@@ -215,11 +215,11 @@ func (client *Client) runOnce() {
 		case <-time.After(time.Second):
 		}
 
-		client.sendErr(err)
+		client.completeCnabling(err)
 		return
 	}
 
-	client.sendErr(nil)
+	client.completeCnabling(nil)
 
 	select {
 	case <-client.notify:

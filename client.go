@@ -21,6 +21,8 @@ type Callback func(*Lease)
 
 // Client is a DHCP client instance
 type Client struct {
+	clientName string // for loging
+
 	Hostname    string
 	Iface       func() *net.Interface
 	Lease       *Lease           // The current lease
@@ -92,16 +94,17 @@ func (client *Client) AddParamRequest(dhcpOpt layers.DHCPOpt) {
 }
 
 // NewClient -
-func NewClient(HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound Callback) *Client {
+func NewClient(clientName string, HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound Callback) *Client {
 	mx := sync.Mutex{}
 	mx.Lock()
 
 	client := &Client{
-		Iface:   getIface,
-		HWAddr:  HWAddr,
-		OnBound: OnBound,
-		notify:  make(chan struct{}),
-		c:       sync.NewCond(&mx),
+		clientName: clientName,
+		Iface:      getIface,
+		HWAddr:     HWAddr,
+		OnBound:    OnBound,
+		notify:     make(chan struct{}),
+		c:          sync.NewCond(&mx),
 	}
 
 	// Add default DHCP options if none added yet.
@@ -117,7 +120,7 @@ func NewClient(HWAddr net.HardwareAddr, getIface func() *net.Interface, OnBound 
 
 // Enable starts the client
 func (client *Client) Enable() {
-	log.Printf("dhclient: start for [%s]", client.Iface().Name)
+	log.Printf("dhclient [%s]: start", client.clientName)
 
 	if client.isEnabled {
 		client.Rebind()
@@ -130,7 +133,7 @@ func (client *Client) Enable() {
 
 // Disable stops the client
 func (client *Client) Disable() {
-	log.Printf("dhclient: stop for [%s]", client.Iface().Name)
+	log.Printf("dhclient [%s]: stop", client.clientName)
 
 	client.isEnabled = false
 	client.sendNotify()
@@ -138,7 +141,7 @@ func (client *Client) Disable() {
 
 // Destroy -
 func (client *Client) Destroy() {
-	log.Printf("dhclient: destroy for [%s]", client.Iface().Name)
+	log.Printf("dhclient [%s]: destroy", client.clientName)
 
 	client.isDied = true
 	client.sendNotify()
@@ -154,7 +157,7 @@ func (client *Client) sendNotify() {
 
 // Renew triggers the renewal of the current lease
 func (client *Client) Renew() {
-	log.Printf("dhclient: renew on [%s]", client.Iface().Name)
+	log.Printf("dhclient [%s]: renew", client.clientName)
 
 	client.sendNotify()
 }
@@ -192,7 +195,7 @@ func (client *Client) runOnce() {
 	}
 
 	if err != nil {
-		log.Printf("dhclient: [%s] error: %s", client.Iface().Name, err)
+		log.Printf("dhclient [%s]: error: %s", client.clientName, err)
 		// delay for a second
 		select {
 		case <-client.notify:
@@ -222,8 +225,13 @@ func (client *Client) unbound() {
 	client.Lease = nil
 }
 
-func (client *Client) withConnection(f func() error) error {
-	conn, err := raw.ListenPacket(client.Iface(), uint16(layers.EthernetTypeIPv4), nil)
+func (client *Client) withConnection(f func(ifi *net.Interface) error) error {
+	ifi := client.Iface()
+	if ifi == nil {
+		return fmt.Errorf("Interface not found")
+	}
+
+	conn, err := raw.ListenPacket(ifi, uint16(layers.EthernetTypeIPv4), nil)
 	if err != nil {
 		return err
 	}
@@ -235,23 +243,23 @@ func (client *Client) withConnection(f func() error) error {
 		client.conn = nil
 	}()
 
-	return f()
+	return f(ifi)
 }
 
-func (client *Client) discoverAndRequest() error {
-	lease, err := client.discover()
+func (client *Client) discoverAndRequest(ifi *net.Interface) error {
+	lease, err := client.discover(ifi)
 	if err != nil {
 		return err
 	}
-	return client.request(lease)
+	return client.request(ifi, lease)
 }
 
-func (client *Client) renew() error {
-	return client.request(client.Lease)
+func (client *Client) renew(ifi *net.Interface) error {
+	return client.request(ifi, client.Lease)
 }
 
-func (client *Client) discover() (*Lease, error) {
-	err := client.sendPacket(layers.DHCPMsgTypeDiscover, client.DHCPOptions)
+func (client *Client) discover(ifi *net.Interface) (*Lease, error) {
+	err := client.sendPacket(ifi, layers.DHCPMsgTypeDiscover, client.DHCPOptions)
 
 	if err != nil {
 		return nil, err
@@ -265,8 +273,8 @@ func (client *Client) discover() (*Lease, error) {
 	return lease, nil
 }
 
-func (client *Client) request(lease *Lease) error {
-	err := client.sendPacket(layers.DHCPMsgTypeRequest, append(client.DHCPOptions,
+func (client *Client) request(ifi *net.Interface, lease *Lease) error {
+	err := client.sendPacket(ifi, layers.DHCPMsgTypeRequest, append(client.DHCPOptions,
 		Option{layers.DHCPOptRequestIP, []byte(lease.FixedAddress)},
 		Option{layers.DHCPOptServerID, []byte(lease.ServerID)},
 	))
@@ -305,23 +313,23 @@ func (client *Client) request(lease *Lease) error {
 		err = errors.New("received NAK")
 		client.unbound()
 	default:
-		err = fmt.Errorf("dhclient: unexpected response: %s", msgType.String())
+		err = fmt.Errorf("dhclient [%s]: unexpected response: %s", client.clientName, msgType.String())
 	}
 
 	return err
 }
 
 // sendPacket creates and sends a DHCP packet
-func (client *Client) sendPacket(msgType layers.DHCPMsgType, options []Option) error {
-	log.Printf("dhclient: [%s] sending %s", client.Iface().Name, msgType)
-	return client.sendMulticast(client.newPacket(msgType, options))
+func (client *Client) sendPacket(ifi *net.Interface, msgType layers.DHCPMsgType, options []Option) error {
+	log.Printf("dhclient [%s]: sending %s", client.clientName, msgType)
+	return client.sendMulticast(ifi, client.newPacket(ifi, msgType, options))
 }
 
 // newPacket creates a DHCP packet
-func (client *Client) newPacket(msgType layers.DHCPMsgType, options []Option) *layers.DHCPv4 {
+func (client *Client) newPacket(ifi *net.Interface, msgType layers.DHCPMsgType, options []Option) *layers.DHCPv4 {
 	hwAddr := client.HWAddr
 	if hwAddr == nil {
-		hwAddr = client.Iface().HardwareAddr
+		hwAddr = ifi.HardwareAddr
 	}
 	packet := layers.DHCPv4{
 		Operation:    layers.DHCPOpRequest,
@@ -349,10 +357,10 @@ func (client *Client) newPacket(msgType layers.DHCPMsgType, options []Option) *l
 	return &packet
 }
 
-func (client *Client) sendMulticast(dhcp *layers.DHCPv4) error {
+func (client *Client) sendMulticast(ifi *net.Interface, dhcp *layers.DHCPv4) error {
 	eth := layers.Ethernet{
 		EthernetType: layers.EthernetTypeIPv4,
-		SrcMAC:       client.Iface().HardwareAddr,
+		SrcMAC:       ifi.HardwareAddr,
 		DstMAC:       layers.EthernetBroadcast,
 	}
 	ip := layers.IPv4{
@@ -407,7 +415,7 @@ func (client *Client) waitForResponse(msgTypes ...layers.DHCPMsgType) (layers.DH
 			// do we have the expected message type?
 			for _, t := range msgTypes {
 				if t == msgType {
-					log.Printf("dhclient: [%s] received %s", client.Iface().Name, msgType)
+					log.Printf("dhclient [%s]: received %s", client.clientName, msgType)
 					return msgType, &res, nil
 				}
 			}

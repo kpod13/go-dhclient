@@ -1,4 +1,4 @@
-module github.com/digineo/go-dhclient
+module github.com/kpod13/go-dhclient
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
